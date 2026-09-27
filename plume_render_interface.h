@@ -247,6 +247,12 @@ namespace plume {
         virtual const RenderDeviceCapabilities &getCapabilities() const = 0;
         virtual const RenderDeviceDescription &getDescription() const = 0;
         virtual RenderSampleCounts getSampleCountsSupported(RenderFormat format) const = 0;
+
+        // Persistent pipeline cache. Optional: a backend that does not implement
+        // these reports no support and every pipeline is built exactly as before.
+        // Handing a backend data it rejects is a no-op, never a failure.
+        virtual bool setPipelineCacheData(const void *data, uint64_t size) { (void)data; (void)size; return false; }
+        virtual std::vector<uint8_t> getPipelineCacheData() const { return std::vector<uint8_t>(); }
         virtual bool beginCapture() = 0;
         virtual bool endCapture() = 0;
     };

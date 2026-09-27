@@ -433,6 +433,14 @@ namespace plume {
 
     struct D3D12Device : RenderDevice {
         ID3D12Device8 *d3d = nullptr;
+        // Pipelines the driver has already built, carried between runs. The
+        // library does NOT copy the blob it is created from, so the blob has to
+        // stay alive and untouched for as long as the library does.
+        ID3D12PipelineLibrary *pipelineLibrary = nullptr;
+        std::vector<uint8_t> pipelineLibraryBlob;
+        // ID3D12PipelineLibrary is not internally synchronized, and Load and
+        // Store are both called from the shader compilation threads.
+        mutable std::mutex pipelineLibraryMutex;
         D3D12Interface *renderInterface = nullptr;
         IDXGIAdapter1 *adapter = nullptr;
         D3D12MA::Allocator *allocator = nullptr;
@@ -473,6 +481,8 @@ namespace plume {
         const RenderDeviceCapabilities &getCapabilities() const override;
         const RenderDeviceDescription &getDescription() const override;
         RenderSampleCounts getSampleCountsSupported(RenderFormat format) const override;
+        bool setPipelineCacheData(const void *data, uint64_t size) override;
+        std::vector<uint8_t> getPipelineCacheData() const override;
         void release();
         bool isValid() const;
         bool beginCapture() override;
