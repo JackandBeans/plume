@@ -4055,7 +4055,15 @@ extern "C" {
     }
 
     std::unique_ptr<RenderTexture> D3D12Device::createTexture(const RenderTextureDesc &desc) {
-        return std::make_unique<D3D12Texture>(this, nullptr, desc);
+        auto texture = std::make_unique<D3D12Texture>(this, nullptr, desc);
+        // Pokemon Snap port: a texture the card could not make (CreateResource
+        // failed, E_OUTOFMEMORY at a Super Sampling the memory cannot carry,
+        // issue #28) comes back as nothing, not as an object with a null
+        // resource for the caller to read.
+        if (texture->d3d == nullptr) {
+            return nullptr;
+        }
+        return texture;
     }
 
     std::unique_ptr<RenderAccelerationStructure> D3D12Device::createAccelerationStructure(const RenderAccelerationStructureDesc &desc) {

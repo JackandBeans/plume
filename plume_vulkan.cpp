@@ -4232,7 +4232,13 @@ namespace plume {
     }
 
     std::unique_ptr<RenderTexture> VulkanDevice::createTexture(const RenderTextureDesc &desc) {
-        return std::make_unique<VulkanTexture>(this, nullptr, desc);
+        auto texture = std::make_unique<VulkanTexture>(this, nullptr, desc);
+        // Pokemon Snap port: an image the card could not make (vmaCreateImage
+        // failed) comes back as nothing, as on Direct3D (issue #28).
+        if (texture->vk == VK_NULL_HANDLE) {
+            return nullptr;
+        }
+        return texture;
     }
 
     std::unique_ptr<RenderAccelerationStructure> VulkanDevice::createAccelerationStructure(const RenderAccelerationStructureDesc &desc) {
