@@ -50,7 +50,7 @@ namespace plume {
 #   endif
 #   if defined(_WIN64)
         VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
-#   elif defined(__ANDROID__)
+#   elif defined(__ANDROID__) && !defined(PLUME_SDL_VULKAN_ENABLED)
         VK_KHR_ANDROID_SURFACE_EXTENSION_NAME,
 #   elif defined(__linux__)
 #   if !defined(PLUME_SDL_VULKAN_ENABLED)
@@ -2102,7 +2102,7 @@ namespace plume {
             fprintf(stderr, "SDL_Vulkan_CreateSurface failed with error %s.\n", SDL_GetError());
             return;
         }
-#   elif defined(__ANDROID__)
+#   elif defined(__ANDROID__) && !defined(PLUME_SDL_VULKAN_ENABLED)
         assert(desc.renderWindow != nullptr);
         VkAndroidSurfaceCreateInfoKHR surfaceCreateInfo = {};
         surfaceCreateInfo.sType = VK_STRUCTURE_TYPE_ANDROID_SURFACE_CREATE_INFO_KHR;
@@ -2465,7 +2465,7 @@ namespace plume {
         dstHeight = rect.bottom - rect.top;
 #   elif defined(PLUME_SDL_VULKAN_ENABLED)
         SDL_GetWindowSizeInPixels(desc.renderWindow, (int *)(&dstWidth), (int *)(&dstHeight));
-#   elif defined(__ANDROID__)
+#   elif defined(__ANDROID__) && !defined(PLUME_SDL_VULKAN_ENABLED)
         dstWidth = ANativeWindow_getWidth(desc.renderWindow);
         dstHeight = ANativeWindow_getHeight(desc.renderWindow);
 #   elif defined(__linux__)

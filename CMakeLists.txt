@@ -14,10 +14,14 @@ if(APPLE)
 endif()
 
 string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "Linux" IS_LINUX)
+# Snap64 Recomp: Android too, whose SDL window gives the Vulkan surface the
+# way the Linux one does (the Android arms of the Vulkan backend are for a
+# native window and step aside when the SDL integration is on).
+string(COMPARE EQUAL ${CMAKE_SYSTEM_NAME} "Android" IS_ANDROID)
 
 # Project options
 include(CMakeDependentOption)
-cmake_dependent_option(PLUME_SDL_VULKAN_ENABLED "Enable SDL Vulkan integration" OFF IS_LINUX OFF)
+cmake_dependent_option(PLUME_SDL_VULKAN_ENABLED "Enable SDL Vulkan integration" OFF "IS_LINUX OR IS_ANDROID" OFF)
 cmake_dependent_option(PLUME_D3D12_AGILITY_SDK_ENABLED "Enable D3D12 Agility SDK" OFF WIN32 OFF)
 cmake_dependent_option(PLUME_APPLE_RETINA_ENABLED "Enable Apple Retina display support" ON APPLE ON)
 option(PLUME_BUILD_EXAMPLES "Build example applications" OFF)
