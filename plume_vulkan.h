@@ -261,6 +261,9 @@ namespace plume {
         void getWindowSize(uint32_t &dstWidth, uint32_t &dstHeight) const;
         void releaseSwapChain();
         void releaseImageViews();
+#   if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        bool recreateSurface();
+#   endif
     };
 
     struct VulkanFramebuffer : RenderFramebuffer {

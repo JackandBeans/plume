@@ -15,6 +15,10 @@
 #include <climits>
 #include <unordered_map>
 
+#if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+#   include <SDL_syswm.h>
+#endif
+
 #if DLSS_ENABLED
 #   include "render/plume_dlss.h"
 #endif
@@ -2317,6 +2321,14 @@ namespace plume {
             return false;
         }
 
+#   if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        // Snap64 Recomp: a surface lost while the app was away (below) and
+        // not made again yet.
+        if ((surface == VK_NULL_HANDLE) && !recreateSurface()) {
+            return false;
+        }
+#   endif
+
         // Destroy any image view references to the current swap chain.
         releaseImageViews();
 
@@ -2347,6 +2359,23 @@ namespace plume {
         createInfo.oldSwapchain = vk;
 
         VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
+#   if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+        // Snap64 Recomp: Android destroys the window's surface when the app
+        // goes to the background and makes a new one when it returns, so the
+        // Vulkan surface made from the old one is lost. It is made again
+        // from the window SDL holds now, and the swap chain with it; while
+        // the app is away SDL holds none, and this waits for the return.
+        if ((res == VK_ERROR_SURFACE_LOST_KHR) || (res == VK_ERROR_NATIVE_WINDOW_IN_USE_KHR)) {
+            if (recreateSurface()) {
+                createInfo.surface = surface;
+                createInfo.oldSwapchain = VK_NULL_HANDLE;
+                res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
+            }
+            else {
+                return false;
+            }
+        }
+#   endif
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateSwapchainKHR failed with error code 0x%X.\n", res);
             return false;
@@ -2399,6 +2428,34 @@ namespace plume {
 
         return true;
     }
+
+#   if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
+    bool VulkanSwapChain::recreateSurface() {
+        SDL_SysWMinfo info;
+        SDL_VERSION(&info.version);
+        if (!SDL_GetWindowWMInfo(desc.renderWindow, &info) || (info.info.android.window == nullptr)) {
+            // The app is still in the background: no window to draw to yet.
+            return false;
+        }
+
+        // The old swap chain goes first; it belongs to the lost surface.
+        releaseSwapChain();
+        VulkanInterface *renderInterface = commandQueue->device->renderInterface;
+        if (surface != VK_NULL_HANDLE) {
+            vkDestroySurfaceKHR(renderInterface->instance, surface, nullptr);
+            surface = VK_NULL_HANDLE;
+        }
+
+        if (SDL_Vulkan_CreateSurface(desc.renderWindow, renderInterface->instance, &surface) == SDL_FALSE) {
+            fprintf(stderr, "SDL_Vulkan_CreateSurface failed with error %s.\n", SDL_GetError());
+            surface = VK_NULL_HANDLE;
+            return false;
+        }
+
+        fprintf(stderr, "[SNAP-LIFE] the window's Vulkan surface was made again\n");
+        return true;
+    }
+#   endif
 
     bool VulkanSwapChain::needsResize() const {
         uint32_t windowWidth, windowHeight;
