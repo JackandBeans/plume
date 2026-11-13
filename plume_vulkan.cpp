@@ -14,6 +14,37 @@
 #include <cmath>
 #include <climits>
 #include <unordered_map>
+#include <atomic>
+#include <cstdlib>
+#include <mutex>
+
+// Snap64 (issue 36): the update-after-bind descriptor pools alive and the descriptors each holds, for the
+// log when an allocation is refused.
+static std::mutex snapUabMutex;
+static std::unordered_map<VkDescriptorPool, uint32_t> snapUabPools;
+
+// SNAP_VK_POOL_TEST, a check's switch: 0 unset; 1 plays the Adreno accounting (a variable-count set is
+// refused while its pool holds less than its layout declares); 2 also treats the device as Qualcomm's.
+static int snapPoolTestMode() {
+    static const int mode = [] {
+        const char *value = std::getenv("SNAP_VK_POOL_TEST");
+        return (value != nullptr) ? std::atoi(value) : 0;
+    }();
+    return mode;
+}
+
+// Qualcomm's Adreno drivers charge a variable-count binding's declared count to the pool, whatever count
+// is asked (found on an Adreno 740 with Android 13 by another RT64 port, cvlod_recomp), so on those the
+// pool holds the declared count from the start.
+static bool snapPoolsAtDeclaredCount(uint32_t vendorID) {
+    const bool declared = (vendorID == 0x5143) || (snapPoolTestMode() == 2);
+    static std::atomic<bool> said{false};
+    if (declared && !said.exchange(true)) {
+        fprintf(stderr, "[SNAP-VK] descriptor pools: a variable-count set's pool holds its layout's declared count on this driver (vendor 0x%X%s)\n",
+            vendorID, (snapPoolTestMode() == 2) ? ", SNAP_VK_POOL_TEST=2" : "");
+    }
+    return declared;
+}
 
 #if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
 #   include <SDL_syswm.h>
@@ -1895,6 +1926,7 @@ namespace plume {
         typeCounts.clear();
         
         uint32_t boundlessRangeSize = 0;
+        uint32_t snapBoundlessHeld = 0;
         uint32_t rangeCount = desc.descriptorRangesCount;
         if (desc.lastRangeIsBoundless) {
             assert((desc.descriptorRangesCount > 0) && "There must be at least one descriptor set to define the last range as boundless.");
@@ -1903,7 +1935,10 @@ namespace plume {
             boundlessRangeSize = std::max(desc.boundlessRangeSize, 1U);
 
             const RenderDescriptorRange &lastDescriptorRange = desc.descriptorRanges[desc.descriptorRangesCount - 1];
-            typeCounts[toVk(lastDescriptorRange.type)] += boundlessRangeSize;
+            // Snap64 (issue 36): the declared count on a Qualcomm driver, the count asked elsewhere.
+            snapBoundlessHeld = snapPoolsAtDeclaredCount(device->physicalDeviceProperties.vendorID)
+                ? std::max(lastDescriptorRange.count, boundlessRangeSize) : boundlessRangeSize;
+            typeCounts[toVk(lastDescriptorRange.type)] += snapBoundlessHeld;
             rangeCount--;
         }
 
@@ -1934,6 +1969,56 @@ namespace plume {
         }
 
         VkResult res = vkAllocateDescriptorSets(device->vk, &allocateInfo, &vk);
+        const uint32_t snapDeclared = desc.lastRangeIsBoundless ? desc.descriptorRanges[desc.descriptorRangesCount - 1].count : 0;
+        // Snap64: SNAP_VK_POOL_TEST plays the Adreno driver on any device, for a check: a variable-count
+        // set is refused while its pool holds less than its layout declares.
+        if ((res == VK_SUCCESS) && desc.lastRangeIsBoundless && (snapPoolTestMode() != 0) && (snapBoundlessHeld < snapDeclared)) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                fprintf(stderr, "[SNAP-VK] SNAP_VK_POOL_TEST: a variable-count descriptor set is refused while its pool holds less than its layout declares\n");
+            }
+            vk = VK_NULL_HANDLE;
+            res = VK_ERROR_OUT_OF_POOL_MEMORY;
+        }
+        if ((res == VK_ERROR_OUT_OF_POOL_MEMORY) || (res == VK_ERROR_FRAGMENTED_POOL)) {
+            // Snap64 (issue 36): a driver that refuses the pool gets the set asked for once more, from a
+            // pool that holds the layout's declared count. What was asked is in the log.
+            uint32_t livePools = 0;
+            uint32_t liveDescriptors = 0;
+            {
+                std::lock_guard<std::mutex> lock(snapUabMutex);
+                livePools = uint32_t(snapUabPools.size());
+                for (const auto &it : snapUabPools) {
+                    liveDescriptors += it.second;
+                }
+            }
+            fprintf(stderr, "[SNAP-VK] descriptor set refused (0x%X): %u ranges, boundless %s (asked %u of a declared %u, pool held %u), update-after-bind pools alive %u holding %u descriptors; this pool held:",
+                res, desc.descriptorRangesCount, desc.lastRangeIsBoundless ? "yes" : "no", boundlessRangeSize, snapDeclared, snapBoundlessHeld, livePools, liveDescriptors);
+            for (const auto &it : typeCounts) {
+                fprintf(stderr, " type %d x%u", int(it.first), it.second);
+            }
+            fprintf(stderr, "\n");
+            {
+                std::lock_guard<std::mutex> lock(snapUabMutex);
+                snapUabPools.erase(descriptorPool);
+            }
+            vkDestroyDescriptorPool(device->vk, descriptorPool, nullptr);
+            descriptorPool = VK_NULL_HANDLE;
+            vk = VK_NULL_HANDLE;
+            if (desc.lastRangeIsBoundless && (snapDeclared > snapBoundlessHeld)) {
+                std::unordered_map<VkDescriptorType, uint32_t> fullCounts = typeCounts;
+                fullCounts[toVk(desc.descriptorRanges[desc.descriptorRangesCount - 1].type)] += snapDeclared - snapBoundlessHeld;
+                descriptorPool = createDescriptorPool(device, fullCounts, true);
+                if (descriptorPool != VK_NULL_HANDLE) {
+                    allocateInfo.descriptorPool = descriptorPool;
+                    res = vkAllocateDescriptorSets(device->vk, &allocateInfo, &vk);
+                    fprintf(stderr, "[SNAP-VK] descriptor set: the retry at the declared count was %s (0x%X)\n", (res == VK_SUCCESS) ? "allocated" : "refused again", res);
+                    if (res != VK_SUCCESS) {
+                        vk = VK_NULL_HANDLE;
+                    }
+                }
+            }
+        }
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkAllocateDescriptorSets failed with error code 0x%X.\n", res);
             return;
@@ -1942,6 +2027,10 @@ namespace plume {
 
     VulkanDescriptorSet::~VulkanDescriptorSet() {
         if (descriptorPool != VK_NULL_HANDLE) {
+            {
+                std::lock_guard<std::mutex> lock(snapUabMutex);
+                snapUabPools.erase(descriptorPool);
+            }
             vkDestroyDescriptorPool(device->vk, descriptorPool, nullptr);
         }
 
@@ -2025,6 +2114,12 @@ namespace plume {
     void VulkanDescriptorSet::setDescriptor(uint32_t descriptorIndex, const VkDescriptorBufferInfo *bufferInfo, const VkDescriptorImageInfo *imageInfo, const VkBufferView *texelBufferView, void *pNext) {
         assert(descriptorIndex < setLayout->descriptorBindingIndices.size());
 
+        // Snap64 guard: a set whose allocation the driver refused has no handle; writing into it crashes
+        // inside the driver, far from the refusal the log already names.
+        if (vk == VK_NULL_HANDLE) {
+            return;
+        }
+
         const uint32_t indexBase = setLayout->descriptorIndexBases[descriptorIndex];
         const uint32_t bindingIndex = setLayout->descriptorBindingIndices[descriptorIndex];
         const VkDescriptorSetLayoutBinding &setLayoutBinding = setLayout->setBindings[bindingIndex];
@@ -2067,6 +2162,14 @@ namespace plume {
 
         VkResult res = vkCreateDescriptorPool(device->vk, &poolInfo, nullptr, &descriptorPool);
         if (res == VK_SUCCESS) {
+            if (lastRangeIsBoundless) {
+                uint32_t total = 0;
+                for (const VkDescriptorPoolSize &size : poolSizes) {
+                    total += size.descriptorCount;
+                }
+                std::lock_guard<std::mutex> lock(snapUabMutex);
+                snapUabPools[descriptorPool] = total;
+            }
             return descriptorPool;
         }
         else {
@@ -3133,13 +3236,23 @@ namespace plume {
         }
     }
 
+    // Snap64 guard: Vulkan forbids a scissor with a negative offset, so a rectangle that starts left of
+    // or above the target is cut to start at its edge. A valid rectangle comes out as it went in.
+    static VkRect2D snapScissor(const RenderRect &rect) {
+        const int32_t left = std::max(rect.left, 0);
+        const int32_t top = std::max(rect.top, 0);
+        const int32_t right = std::max(rect.right, left);
+        const int32_t bottom = std::max(rect.bottom, top);
+        return VkRect2D{ VkOffset2D{ left, top }, VkExtent2D{ uint32_t(right - left), uint32_t(bottom - top) } };
+    }
+
     void VulkanCommandList::setScissors(const RenderRect *scissorRects, uint32_t count) {
         if (count > 1) {
             thread_local std::vector<VkRect2D> scissorVector;
             scissorVector.clear();
 
             for (uint32_t i = 0; i < count; i++) {
-                scissorVector.emplace_back(VkRect2D{ VkOffset2D{ scissorRects[i].left, scissorRects[i].top }, VkExtent2D{ uint32_t(scissorRects[i].right - scissorRects[i].left), uint32_t(scissorRects[i].bottom - scissorRects[i].top) } });
+                scissorVector.emplace_back(snapScissor(scissorRects[i]));
             }
 
             if (!scissorVector.empty()) {
@@ -3148,7 +3261,7 @@ namespace plume {
         }
         else {
             // Single element fast path.
-            VkRect2D scissor = VkRect2D{ VkOffset2D{ scissorRects[0].left, scissorRects[0].top }, VkExtent2D{ uint32_t(scissorRects[0].right - scissorRects[0].left), uint32_t(scissorRects[0].bottom - scissorRects[0].top) } };
+            VkRect2D scissor = snapScissor(scissorRects[0]);
             vkCmdSetScissor(vk, 0, 1, &scissor);
         }
     }
@@ -3174,11 +3287,21 @@ namespace plume {
 
         if (clearRectsCount > 0) {
             for (uint32_t i = 0; i < clearRectsCount; i++) {
+                // Snap64 guard: Vulkan wants a clear's rectangles inside the render area, and RT64's
+                // inclusive N64 fill rectangles pass a pixel beyond it (321 wide on a 320 target).
+                const int32_t left = std::max(clearRects[i].left, 0);
+                const int32_t top = std::max(clearRects[i].top, 0);
+                const int32_t right = std::min(clearRects[i].right, int32_t(width));
+                const int32_t bottom = std::min(clearRects[i].bottom, int32_t(height));
+                if ((right <= left) || (bottom <= top)) {
+                    continue;
+                }
+
                 VkClearRect clearRect;
-                clearRect.rect.offset.x = clearRects[i].left;
-                clearRect.rect.offset.y = clearRects[i].top;
-                clearRect.rect.extent.width = clearRects[i].right - clearRects[i].left;
-                clearRect.rect.extent.height = clearRects[i].bottom - clearRects[i].top;
+                clearRect.rect.offset.x = left;
+                clearRect.rect.offset.y = top;
+                clearRect.rect.extent.width = right - left;
+                clearRect.rect.extent.height = bottom - top;
                 clearRect.baseArrayLayer = 0;
                 clearRect.layerCount = 1;
                 rectVector.emplace_back(clearRect);
@@ -3205,6 +3328,9 @@ namespace plume {
 
         thread_local std::vector<VkClearRect> rectVector;
         clearCommonRectVector(targetFramebuffer->getWidth(), targetFramebuffer->getHeight(), clearRects, clearRectsCount, rectVector);
+        if (rectVector.empty()) {
+            return;
+        }
 
         VkClearAttachment attachment = {};
         auto &rgba = attachment.clearValue.color.float32;
@@ -3225,6 +3351,9 @@ namespace plume {
 
         thread_local std::vector<VkClearRect> rectVector;
         clearCommonRectVector(targetFramebuffer->getWidth(), targetFramebuffer->getHeight(), clearRects, clearRectsCount, rectVector);
+        if (rectVector.empty()) {
+            return;
+        }
 
         VkClearAttachment attachment = {};
         attachment.clearValue.depthStencil.depth = depthValue;
@@ -4223,6 +4352,23 @@ namespace plume {
         capabilities.resolveRegion = true;
         capabilities.resolveModes = false;
         capabilities.descriptorIndexing = descriptorIndexingSupported;
+        // Snap64 (issue 36): what the driver says of descriptor indexing, once, for the log. The limits
+        // are asked only where the extension is listed or the device is Vulkan 1.2, where they are core.
+        {
+            VkPhysicalDeviceDescriptorIndexingPropertiesEXT indexingProps = {};
+            indexingProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_PROPERTIES_EXT;
+            VkPhysicalDeviceProperties2 props2 = {};
+            props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            if (descriptorIndexingFound || (physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2)) {
+                props2.pNext = &indexingProps;
+            }
+            vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
+            fprintf(stderr, "[SNAP-VK] descriptor indexing: extension %s, in use %s; update-after-bind descriptors in all pools %u; sampled images per stage %u (update after bind %u), per set %u (update after bind %u)\n",
+                descriptorIndexingFound ? "listed" : "not listed", descriptorIndexingSupported ? "yes" : "no",
+                indexingProps.maxUpdateAfterBindDescriptorsInAllPools,
+                props2.properties.limits.maxPerStageDescriptorSampledImages, indexingProps.maxPerStageDescriptorUpdateAfterBindSampledImages,
+                props2.properties.limits.maxDescriptorSetSampledImages, indexingProps.maxDescriptorSetUpdateAfterBindSampledImages);
+        }
         capabilities.scalarBlockLayout = scalarBlockLayoutSupported;
         capabilities.bufferDeviceAddress = bufferDeviceAddressSupported;
         capabilities.samplerMirrorClampToEdge = supportedOptionalExtensions.find(VK_KHR_SAMPLER_MIRROR_CLAMP_TO_EDGE_EXTENSION_NAME) != supportedOptionalExtensions.end();
