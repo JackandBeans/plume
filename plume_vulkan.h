@@ -347,6 +347,7 @@ namespace plume {
         void writeTimestamp(const RenderQueryPool *queryPool, uint32_t queryIndex) override;
         void checkActiveRenderPass();
         void endActiveRenderPass();
+        void snapOutsideRenderPass(const char *what);
         void setDescriptorSet(VkPipelineBindPoint bindPoint, const VulkanPipelineLayout *pipelineLayout, const RenderDescriptorSet *descriptorSet, uint32_t setIndex);
     };
 

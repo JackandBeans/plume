@@ -3274,6 +3274,9 @@ namespace plume {
     void VulkanCommandList::dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) {
         assert(activeComputePipelineLayout != nullptr);
 
+        // Snap64 (issue 36): Vulkan allows a dispatch only outside a render pass.
+        snapOutsideRenderPass("a dispatch");
+
         SNAP_VK_OP(vkCmdDispatch);
         vkCmdDispatch(vk, threadGroupCountX, threadGroupCountY, threadGroupCountZ);
     }
@@ -3801,6 +3804,9 @@ namespace plume {
         assert(srcTexture != nullptr);
         assert(resolveMode == RenderResolveMode::AVERAGE && "Vulkan only supports AVERAGE resolve mode.");
 
+        // Snap64 (issue 36): Vulkan allows a resolve only outside a render pass.
+        snapOutsideRenderPass("a resolve");
+
         thread_local std::vector<VkImageResolve> imageResolves;
         imageResolves.clear();
 
@@ -3935,6 +3941,11 @@ namespace plume {
     void VulkanCommandList::resetQueryPool(const RenderQueryPool *queryPool, uint32_t queryFirstIndex, uint32_t queryCount) {
         assert(queryPool != nullptr);
 
+        // Snap64 (issue 36): Vulkan allows a query pool reset only outside a render pass. The port's first-use
+        // clear of a new target opens a pass just ahead of the frame's reset, and an AYN Thor's Adreno driver
+        // crashed ending that pass. An open pass is ended first, as the copies and barriers here already do.
+        snapOutsideRenderPass("a query pool reset");
+
         const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
         SNAP_VK_OP(vkCmdResetQueryPool);
         vkCmdResetQueryPool(vk, interfaceQueryPool->vk, queryFirstIndex, queryCount);
@@ -3970,6 +3981,24 @@ namespace plume {
             vkCmdEndRenderPass(vk);
             activeRenderPass = VK_NULL_HANDLE;
         }
+    }
+
+    // Snap64 (issue 36): a command Vulkan allows only outside a render pass ends an open one first. Each kind
+    // says so once in the log, the first time it finds a pass open.
+    void VulkanCommandList::snapOutsideRenderPass(const char *what) {
+        if (activeRenderPass == VK_NULL_HANDLE) {
+            return;
+        }
+        static std::mutex saidMutex;
+        static std::vector<const char *> said;
+        {
+            std::lock_guard<std::mutex> lock(saidMutex);
+            if (std::find(said.begin(), said.end(), what) == said.end()) {
+                said.push_back(what);
+                fprintf(stderr, "[SNAP-VK] %s came with a render pass open; the pass is ended first, as Vulkan requires (said once)\n", what);
+            }
+        }
+        endActiveRenderPass();
     }
 
     void VulkanCommandList::setDescriptorSet(VkPipelineBindPoint bindPoint, const VulkanPipelineLayout *pipelineLayout, const RenderDescriptorSet *descriptorSet, uint32_t setIndex) {
