@@ -16,7 +16,12 @@
 #include <unordered_map>
 #include <atomic>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
+#if defined(__linux__)
+#   include <sys/syscall.h>
+#   include <unistd.h>
+#endif
 
 // Snap64 (issue 36): the update-after-bind descriptor pools alive and the descriptors each holds, for the
 // log when an allocation is refused.
@@ -44,6 +49,121 @@ static bool snapPoolsAtDeclaredCount(uint32_t vendorID) {
             vendorID, (snapPoolTestMode() == 2) ? ", SNAP_VK_POOL_TEST=2" : "");
     }
     return declared;
+}
+
+// Snap64 (issue 36): the Vulkan call each thread began last, kept for the crash record. A signal handler
+// reads it (the port's src/android.cpp), so it is plain atomics in a fixed table: no lock, no allocation.
+struct SnapVkOpSlot {
+    std::atomic<int> tid{0};
+    std::atomic<const char *> name{nullptr};
+    std::atomic<uint32_t> count{0};
+};
+static SnapVkOpSlot snapVkOpSlots[64];
+
+static int snapThreadId() {
+#if defined(_WIN32)
+    return int(GetCurrentThreadId());
+#elif defined(__linux__)
+    return int(syscall(SYS_gettid));
+#else
+    return 0;
+#endif
+}
+
+// A thread's slot: the one that already carries its id (an id the system gave out again), else a free one.
+static SnapVkOpSlot *snapVkOpClaim() {
+    const int tid = snapThreadId();
+    if (tid == 0) {
+        return nullptr;
+    }
+    for (SnapVkOpSlot &slot : snapVkOpSlots) {
+        if (slot.tid.load(std::memory_order_relaxed) == tid) {
+            return &slot;
+        }
+    }
+    for (SnapVkOpSlot &slot : snapVkOpSlots) {
+        int none = 0;
+        if (slot.tid.compare_exchange_strong(none, tid)) {
+            return &slot;
+        }
+    }
+    return nullptr;
+}
+
+// SNAP_CRASH_TEST=<segv|abort>:<call>:<n>, a check's switch: the thread that begins its n-th <call> crashes
+// there, so the crash record can be read back. Unset, it costs one test of a flag.
+struct SnapCrashTest {
+    bool on = false;
+    bool abort = false;
+    char call[64] = {};
+    uint32_t at = 0;
+    SnapCrashTest() {
+        const char *spec = std::getenv("SNAP_CRASH_TEST");
+        if (spec == nullptr) {
+            return;
+        }
+        const char *first = strchr(spec, ':');
+        const char *second = (first != nullptr) ? strchr(first + 1, ':') : nullptr;
+        if ((second == nullptr) || (size_t(second - first - 1) >= sizeof(call))) {
+            return;
+        }
+        abort = (strncmp(spec, "abort", 5) == 0);
+        memcpy(call, first + 1, size_t(second - first - 1));
+        at = uint32_t(std::atoi(second + 1));
+        on = (at > 0);
+        if (on) {
+            fprintf(stderr, "[SNAP-VK] SNAP_CRASH_TEST: the thread that begins its %u-th %s %s there\n", at, call, abort ? "aborts" : "writes to address 0");
+        }
+    }
+};
+
+// Read at the first Vulkan call, not when the library loads: on Android the environment is set after that.
+static const SnapCrashTest &snapCrashTest() {
+    static const SnapCrashTest test;
+    return test;
+}
+
+static inline void snapVkOp(const char *name) {
+    thread_local SnapVkOpSlot *slot = snapVkOpClaim();
+    if (slot != nullptr) {
+        slot->name.store(name, std::memory_order_relaxed);
+        const uint32_t count = slot->count.fetch_add(1, std::memory_order_relaxed) + 1;
+        (void)count;
+        const SnapCrashTest &test = snapCrashTest();
+        if (test.on && (strcmp(name, test.call) == 0)) {
+            // This thread's own count of the named call, not of every call it makes.
+            thread_local uint32_t named = 0;
+            if (++named == test.at) {
+                if (test.abort) {
+                    std::abort();
+                }
+                *static_cast<volatile int *>(nullptr) = 1;
+            }
+        }
+    }
+}
+#define SNAP_VK_OP(call) snapVkOp(#call)
+
+// For the crash record: the last call of the thread with this id (0 when it made none), and the table by index.
+extern "C" int snap_vk_op_of(int tid, const char **name, unsigned *count) {
+    for (SnapVkOpSlot &slot : snapVkOpSlots) {
+        if ((tid != 0) && (slot.tid.load(std::memory_order_relaxed) == tid)) {
+            *name = slot.name.load(std::memory_order_relaxed);
+            *count = slot.count.load(std::memory_order_relaxed);
+            return (*name != nullptr) ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
+extern "C" int snap_vk_op_at(int index, int *tid, const char **name, unsigned *count) {
+    if ((index < 0) || (index >= int(sizeof(snapVkOpSlots) / sizeof(snapVkOpSlots[0])))) {
+        return -1;
+    }
+    *tid = snapVkOpSlots[index].tid.load(std::memory_order_relaxed);
+    *name = snapVkOpSlots[index].name.load(std::memory_order_relaxed);
+    *count = snapVkOpSlots[index].count.load(std::memory_order_relaxed);
+    return ((*tid != 0) && (*name != nullptr)) ? 1 : 0;
 }
 
 #if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
@@ -812,6 +932,7 @@ namespace plume {
         nameInfo.objectType = objectType;
         nameInfo.objectHandle = object;
         nameInfo.pObjectName = name.c_str();
+        SNAP_VK_OP(vkSetDebugUtilsObjectNameEXT);
         VkResult res = vkSetDebugUtilsObjectNameEXT(device, &nameInfo);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkSetDebugUtilsObjectNameEXT failed with error code 0x%X.\n", res);
@@ -918,9 +1039,11 @@ namespace plume {
 
         VkResult res;
         if (minAlignment > 0) {
+            SNAP_VK_OP(vmaCreateBufferWithAlignment);
             res = vmaCreateBufferWithAlignment(device->allocator, &bufferInfo, &createInfo, minAlignment, &vk, &allocation, &allocationInfo);
         }
         else {
+            SNAP_VK_OP(vmaCreateBuffer);
             res = vmaCreateBuffer(device->allocator, &bufferInfo, &createInfo, &vk, &allocation, &allocationInfo);
         }
 
@@ -932,12 +1055,14 @@ namespace plume {
 
     VulkanBuffer::~VulkanBuffer() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vmaDestroyBuffer);
             vmaDestroyBuffer(device->allocator, vk, allocation);
         }
     }
 
     void *VulkanBuffer::map(uint32_t subresource, const RenderRange *readRange) {
         void *data = nullptr;
+        SNAP_VK_OP(vmaMapMemory);
         VkResult res = vmaMapMemory(device->allocator, allocation, &data);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vmaMapMemory failed with error code 0x%X.\n", res);
@@ -948,6 +1073,7 @@ namespace plume {
     }
 
     void VulkanBuffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
+        SNAP_VK_OP(vmaUnmapMemory);
         vmaUnmapMemory(device->allocator, allocation);
     }
 
@@ -965,6 +1091,7 @@ namespace plume {
         info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
         info.pNext = nullptr;
         info.buffer = vk;
+        SNAP_VK_OP(vkGetBufferDeviceAddress);
         return vkGetBufferDeviceAddress(device->vk, &info);
     }
 
@@ -983,6 +1110,7 @@ namespace plume {
         createInfo.offset = 0;
         createInfo.range = buffer->desc.size;
 
+        SNAP_VK_OP(vkCreateBufferView);
         VkResult res = vkCreateBufferView(buffer->device->vk, &createInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateBufferView failed with error code 0x%X.\n", res);
@@ -992,6 +1120,7 @@ namespace plume {
 
     VulkanBufferFormattedView::~VulkanBufferFormattedView() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyBufferView);
             vkDestroyBufferView(buffer->device->vk, vk, nullptr);
         }
     }
@@ -1043,6 +1172,7 @@ namespace plume {
             createInfo.flags |= VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
         }
 
+        SNAP_VK_OP(vmaCreateImage);
         VkResult res = vmaCreateImage(device->allocator, &imageInfo, &createInfo, &vk, &allocation, &allocationInfo);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vmaCreateImage failed with error code 0x%X.\n", res);
@@ -1062,10 +1192,12 @@ namespace plume {
 
     VulkanTexture::~VulkanTexture() {
         if (imageView != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyImageView);
             vkDestroyImageView(device->vk, imageView, nullptr);
         }
 
         if (ownership && (vk != VK_NULL_HANDLE)) {
+            SNAP_VK_OP(vmaDestroyImage);
             vmaDestroyImage(device->allocator, vk, allocation);
         }
     }
@@ -1083,6 +1215,7 @@ namespace plume {
         viewInfo.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
         viewInfo.subresourceRange = imageSubresourceRange;
         
+        SNAP_VK_OP(vkCreateImageView);
         VkResult res = vkCreateImageView(device->vk, &viewInfo, nullptr, &imageView);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateImageView failed with error code 0x%X.\n", res);
@@ -1134,6 +1267,7 @@ namespace plume {
         viewInfo.subresourceRange.baseArrayLayer = desc.arrayIndex;
         viewInfo.subresourceRange.layerCount = arraySize;
 
+        SNAP_VK_OP(vkCreateImageView);
         VkResult res = vkCreateImageView(texture->device->vk, &viewInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateImageView failed with error code 0x%X.\n", res);
@@ -1143,6 +1277,7 @@ namespace plume {
 
     VulkanTextureView::~VulkanTextureView() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyImageView);
             vkDestroyImageView(texture->device->vk, vk, nullptr);
         }
     }
@@ -1164,6 +1299,7 @@ namespace plume {
         createInfo.size = desc.size;
         createInfo.type = toVk(desc.type);
 
+        SNAP_VK_OP(vkCreateAccelerationStructureKHR);
         VkResult res = vkCreateAccelerationStructureKHR(device->vk, &createInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateAccelerationStructureKHR failed with error code 0x%X.\n", res);
@@ -1173,6 +1309,7 @@ namespace plume {
 
     VulkanAccelerationStructure::~VulkanAccelerationStructure() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyAccelerationStructureKHR);
             vkDestroyAccelerationStructureKHR(device->vk, vk, nullptr);
         }
     }
@@ -1243,6 +1380,7 @@ namespace plume {
             setLayoutInfo.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
         }
         
+        SNAP_VK_OP(vkCreateDescriptorSetLayout);
         VkResult res = vkCreateDescriptorSetLayout(device->vk, &setLayoutInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateDescriptorSetLayout failed with error code 0x%X.\n", res);
@@ -1252,6 +1390,7 @@ namespace plume {
 
     VulkanDescriptorSetLayout::~VulkanDescriptorSetLayout() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyDescriptorSetLayout);
             vkDestroyDescriptorSetLayout(device->vk, vk, nullptr);
         }
     }
@@ -1298,6 +1437,7 @@ namespace plume {
         layoutInfo.pSetLayouts = !setLayoutHandles.empty() ? setLayoutHandles.data() : nullptr;
         layoutInfo.setLayoutCount = uint32_t(setLayoutHandles.size());
 
+        SNAP_VK_OP(vkCreatePipelineLayout);
         VkResult res = vkCreatePipelineLayout(device->vk, &layoutInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreatePipelineLayout failed with error code 0x%X.\n", res);
@@ -1307,6 +1447,7 @@ namespace plume {
 
     VulkanPipelineLayout::~VulkanPipelineLayout() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyPipelineLayout);
             vkDestroyPipelineLayout(device->vk, vk, nullptr);
         }
 
@@ -1332,6 +1473,7 @@ namespace plume {
         shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         shaderInfo.pCode = reinterpret_cast<const uint32_t *>(data);
         shaderInfo.codeSize = size;
+        SNAP_VK_OP(vkCreateShaderModule);
         VkResult res = vkCreateShaderModule(device->vk, &shaderInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateShaderModule failed with error code 0x%X.\n", res);
@@ -1341,6 +1483,7 @@ namespace plume {
 
     VulkanShader::~VulkanShader() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyShaderModule);
             vkDestroyShaderModule(device->vk, vk, nullptr);
         }
     }
@@ -1374,6 +1517,7 @@ namespace plume {
         samplerInfo.borderColor = toVk(desc.borderColor);
         samplerInfo.unnormalizedCoordinates = VK_FALSE;
 
+        SNAP_VK_OP(vkCreateSampler);
         VkResult res = vkCreateSampler(device->vk, &samplerInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateSampler failed with error code 0x%X.\n", res);
@@ -1383,6 +1527,7 @@ namespace plume {
 
     VulkanSampler::~VulkanSampler() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroySampler);
             vkDestroySampler(device->vk, vk, nullptr);
         }
     }
@@ -1425,15 +1570,23 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.stage = stageInfo;
 
+        SNAP_VK_OP(vkCreateComputePipelines);
         VkResult res = vkCreateComputePipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateComputePipelines failed with error code 0x%X.\n", res);
             return;
         }
+        {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                fprintf(stderr, "[SNAP-VK] the first compute pipeline is made\n");
+            }
+        }
     }
 
     VulkanComputePipeline::~VulkanComputePipeline() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyPipeline);
             vkDestroyPipeline(device->vk, vk, nullptr);
         }
     }
@@ -1684,19 +1837,28 @@ namespace plume {
         pipelineInfo.layout = pipelineLayout->vk;
         pipelineInfo.renderPass = renderPass;
 
+        SNAP_VK_OP(vkCreateGraphicsPipelines);
         VkResult res = vkCreateGraphicsPipelines(device->vk, VK_NULL_HANDLE, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateGraphicsPipelines failed with error code 0x%X.\n", res);
             return;
         }
+        {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                fprintf(stderr, "[SNAP-VK] the first graphics pipeline is made\n");
+            }
+        }
     }
 
     VulkanGraphicsPipeline::~VulkanGraphicsPipeline() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyPipeline);
             vkDestroyPipeline(device->vk, vk, nullptr);
         }
 
         if (renderPass != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyRenderPass);
             vkDestroyRenderPass(device->vk, renderPass, nullptr);
         }
     }
@@ -1765,6 +1927,7 @@ namespace plume {
         passInfo.pSubpasses = &subpass;
         passInfo.subpassCount = 1;
 
+        SNAP_VK_OP(vkCreateRenderPass);
         VkResult res = vkCreateRenderPass(device->vk, &passInfo, nullptr, &renderPass);
         if (res == VK_SUCCESS) {
             return renderPass;
@@ -1890,6 +2053,7 @@ namespace plume {
 
         this->descriptorSetCount = uint32_t(pipelineLayout->descriptorSetLayouts.size());
 
+        SNAP_VK_OP(vkCreateRayTracingPipelinesKHR);
         VkResult res = vkCreateRayTracingPipelinesKHR(device->vk, nullptr, nullptr, 1, &pipelineInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateRayTracingPipelinesKHR failed with error code 0x%X.\n", res);
@@ -1901,6 +2065,7 @@ namespace plume {
     
     VulkanRaytracingPipeline::~VulkanRaytracingPipeline() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyPipeline);
             vkDestroyPipeline(device->vk, vk, nullptr);
         }
     }
@@ -1968,6 +2133,7 @@ namespace plume {
             allocateInfo.pNext = &countInfo;
         }
 
+        SNAP_VK_OP(vkAllocateDescriptorSets);
         VkResult res = vkAllocateDescriptorSets(device->vk, &allocateInfo, &vk);
         const uint32_t snapDeclared = desc.lastRangeIsBoundless ? desc.descriptorRanges[desc.descriptorRangesCount - 1].count : 0;
         // Snap64: SNAP_VK_POOL_TEST plays the Adreno driver on any device, for a check: a variable-count
@@ -2002,6 +2168,7 @@ namespace plume {
                 std::lock_guard<std::mutex> lock(snapUabMutex);
                 snapUabPools.erase(descriptorPool);
             }
+            SNAP_VK_OP(vkDestroyDescriptorPool);
             vkDestroyDescriptorPool(device->vk, descriptorPool, nullptr);
             descriptorPool = VK_NULL_HANDLE;
             vk = VK_NULL_HANDLE;
@@ -2011,6 +2178,7 @@ namespace plume {
                 descriptorPool = createDescriptorPool(device, fullCounts, true);
                 if (descriptorPool != VK_NULL_HANDLE) {
                     allocateInfo.descriptorPool = descriptorPool;
+                    SNAP_VK_OP(vkAllocateDescriptorSets);
                     res = vkAllocateDescriptorSets(device->vk, &allocateInfo, &vk);
                     fprintf(stderr, "[SNAP-VK] descriptor set: the retry at the declared count was %s (0x%X)\n", (res == VK_SUCCESS) ? "allocated" : "refused again", res);
                     if (res != VK_SUCCESS) {
@@ -2023,6 +2191,12 @@ namespace plume {
             fprintf(stderr, "vkAllocateDescriptorSets failed with error code 0x%X.\n", res);
             return;
         }
+        if (desc.lastRangeIsBoundless) {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                fprintf(stderr, "[SNAP-VK] the first variable-count set is allocated (asked %u of a declared %u, its pool made for %u)\n", boundlessRangeSize, snapDeclared, snapBoundlessHeld);
+            }
+        }
     }
 
     VulkanDescriptorSet::~VulkanDescriptorSet() {
@@ -2031,6 +2205,7 @@ namespace plume {
                 std::lock_guard<std::mutex> lock(snapUabMutex);
                 snapUabPools.erase(descriptorPool);
             }
+            SNAP_VK_OP(vkDestroyDescriptorPool);
             vkDestroyDescriptorPool(device->vk, descriptorPool, nullptr);
         }
 
@@ -2135,6 +2310,7 @@ namespace plume {
         writeDescriptor.pImageInfo = imageInfo;
         writeDescriptor.pTexelBufferView = texelBufferView;
 
+        SNAP_VK_OP(vkUpdateDescriptorSets);
         vkUpdateDescriptorSets(device->vk, 1, &writeDescriptor, 0, nullptr);
     }
 
@@ -2160,6 +2336,7 @@ namespace plume {
             poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
         }
 
+        SNAP_VK_OP(vkCreateDescriptorPool);
         VkResult res = vkCreateDescriptorPool(device->vk, &poolInfo, nullptr, &descriptorPool);
         if (res == VK_SUCCESS) {
             if (lastRangeIsBoundless) {
@@ -2197,6 +2374,7 @@ namespace plume {
         surfaceCreateInfo.hinstance = GetModuleHandle(nullptr);
 
         VulkanInterface *renderInterface = commandQueue->device->renderInterface;
+        SNAP_VK_OP(vkCreateWin32SurfaceKHR);
         res = vkCreateWin32SurfaceKHR(renderInterface->instance, &surfaceCreateInfo, nullptr, &surface);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateWin32SurfaceKHR failed with error code 0x%X.\n", res);
@@ -2216,6 +2394,7 @@ namespace plume {
         surfaceCreateInfo.window = desc.renderWindow;
 
         VulkanInterface *renderInterface = commandQueue->device->renderInterface;
+        SNAP_VK_OP(vkCreateAndroidSurfaceKHR);
         res = vkCreateAndroidSurfaceKHR(renderInterface->instance, &surfaceCreateInfo, nullptr, &surface);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateAndroidSurfaceKHR failed with error code 0x%X.\n", res);
@@ -2230,6 +2409,7 @@ namespace plume {
         surfaceCreateInfo.window = desc.renderWindow.window;
 
         VulkanInterface *renderInterface = commandQueue->device->renderInterface;
+        SNAP_VK_OP(vkCreateXlibSurfaceKHR);
         res = vkCreateXlibSurfaceKHR(renderInterface->instance, &surfaceCreateInfo, nullptr, &surface);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateXlibSurfaceKHR failed with error code 0x%X.\n", res);
@@ -2246,6 +2426,7 @@ namespace plume {
         surfaceCreateInfo.pLayer = desc.renderWindow.view;
 
         VulkanInterface *renderInterface = commandQueue->device->renderInterface;
+        SNAP_VK_OP(vkCreateMetalSurfaceEXT);
         res = vkCreateMetalSurfaceEXT(renderInterface->instance, &surfaceCreateInfo, nullptr, &surface);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateMetalSurfaceEXT failed with error code 0x%X.\n", res);
@@ -2255,6 +2436,7 @@ namespace plume {
 
         VkBool32 presentSupported = false;
         VkPhysicalDevice physicalDevice = commandQueue->device->physicalDevice;
+        SNAP_VK_OP(vkGetPhysicalDeviceSurfaceSupportKHR);
         res = vkGetPhysicalDeviceSurfaceSupportKHR(physicalDevice, commandQueue->familyIndex, surface, &presentSupported);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkGetPhysicalDeviceSurfaceSupportKHR failed with error code 0x%X.\n", res);
@@ -2267,6 +2449,7 @@ namespace plume {
         }
 
         VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
+        SNAP_VK_OP(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physicalDevice, surface, &surfaceCapabilities);
 
         // Pick an alpha compositing mode
@@ -2288,15 +2471,19 @@ namespace plume {
         this->desc.textureCount = std::clamp(desc.textureCount, surfaceCapabilities.minImageCount, surfaceCapabilities.maxImageCount);
 
         uint32_t surfaceFormatCount = 0;
+        SNAP_VK_OP(vkGetPhysicalDeviceSurfaceFormatsKHR);
         vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &surfaceFormatCount, nullptr);
 
         std::vector<VkSurfaceFormatKHR> surfaceFormats(surfaceFormatCount);
+        SNAP_VK_OP(vkGetPhysicalDeviceSurfaceFormatsKHR);
         vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, &surfaceFormatCount, surfaceFormats.data());
 
         uint32_t presentModeCount = 0;
+        SNAP_VK_OP(vkGetPhysicalDeviceSurfacePresentModesKHR);
         vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &presentModeCount, nullptr);
 
         std::vector<VkPresentModeKHR> presentModes(presentModeCount);
+        SNAP_VK_OP(vkGetPhysicalDeviceSurfacePresentModesKHR);
         vkGetPhysicalDeviceSurfacePresentModesKHR(physicalDevice, surface, &presentModeCount, presentModes.data());
         immediatePresentModeSupported = std::find(presentModes.begin(), presentModes.end(), VK_PRESENT_MODE_IMMEDIATE_KHR) != presentModes.end();
         mailboxPresentModeSupported = std::find(presentModes.begin(), presentModes.end(), VK_PRESENT_MODE_MAILBOX_KHR) != presentModes.end();
@@ -2353,6 +2540,7 @@ namespace plume {
 
         if (surface != VK_NULL_HANDLE) {
             VulkanInterface *renderInterface = commandQueue->device->renderInterface;
+            SNAP_VK_OP(vkDestroySurfaceKHR);
             vkDestroySurfaceKHR(renderInterface->instance, surface, nullptr);
         }
 
@@ -2390,7 +2578,18 @@ namespace plume {
         VkResult res;
         {
             const std::scoped_lock queueLock(*commandQueue->queue->mutex);
+            SNAP_VK_OP(vkQueuePresentKHR);
             res = vkQueuePresentKHR(commandQueue->queue->vk, &presentInfo);
+        }
+        {
+            // The first present, then a few later ones: how far a run got, in a log that ends without a word.
+            static std::atomic<uint32_t> presents{0};
+            const uint32_t n = presents.fetch_add(1) + 1;
+            if (n == 1) {
+                fprintf(stderr, "[SNAP-VK] the first present returned 0x%X\n", res);
+            } else if ((n == 2) || (n == 3) || (n == 10) || (n == 60) || (n == 300)) {
+                fprintf(stderr, "[SNAP-VK] present %u returned 0x%X\n", n, res);
+            }
         }
 
 #if defined(__APPLE__)
@@ -2412,6 +2611,7 @@ namespace plume {
 
         if (currentPresentId >= desc.maxFrameLatency) {
             constexpr uint64_t waitTimeout = 100000000;
+            SNAP_VK_OP(vkWaitForPresentKHR);
             vkWaitForPresentKHR(commandQueue->device->vk, vk, currentPresentId - (desc.maxFrameLatency - 1), waitTimeout);
         }
     }
@@ -2437,6 +2637,7 @@ namespace plume {
 
         // Query surface capabilities to get the valid extent bounds.
         VkSurfaceCapabilitiesKHR surfaceCapabilities = {};
+        SNAP_VK_OP(vkGetPhysicalDeviceSurfaceCapabilitiesKHR);
         vkGetPhysicalDeviceSurfaceCapabilitiesKHR(commandQueue->device->physicalDevice, surface, &surfaceCapabilities);
 
         // Clamp the extent to the surface capabilities' min/max bounds.
@@ -2461,6 +2662,7 @@ namespace plume {
         createInfo.clipped = VK_TRUE;
         createInfo.oldSwapchain = vk;
 
+        SNAP_VK_OP(vkCreateSwapchainKHR);
         VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
 #   if defined(__ANDROID__) && defined(PLUME_SDL_VULKAN_ENABLED)
         // Snap64 Recomp: Android destroys the window's surface when the app
@@ -2472,6 +2674,7 @@ namespace plume {
             if (recreateSurface()) {
                 createInfo.surface = surface;
                 createInfo.oldSwapchain = VK_NULL_HANDLE;
+                SNAP_VK_OP(vkCreateSwapchainKHR);
                 res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
             }
             else {
@@ -2491,10 +2694,12 @@ namespace plume {
         presentCount = 1;
 
         if (createInfo.oldSwapchain != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroySwapchainKHR);
             vkDestroySwapchainKHR(commandQueue->device->vk, createInfo.oldSwapchain, nullptr);
         }
 
         uint32_t retrievedImageCount = 0;
+        SNAP_VK_OP(vkGetSwapchainImagesKHR);
         vkGetSwapchainImagesKHR(commandQueue->device->vk, vk, &retrievedImageCount, nullptr);
         if (retrievedImageCount < desc.textureCount) {
             releaseSwapChain();
@@ -2505,6 +2710,7 @@ namespace plume {
         desc.textureCount = retrievedImageCount;
 
         std::vector<VkImage> images(desc.textureCount);
+        SNAP_VK_OP(vkGetSwapchainImagesKHR);
         res = vkGetSwapchainImagesKHR(commandQueue->device->vk, vk, &desc.textureCount, images.data());
         if (res != VK_SUCCESS) {
             releaseSwapChain();
@@ -2545,6 +2751,7 @@ namespace plume {
         releaseSwapChain();
         VulkanInterface *renderInterface = commandQueue->device->renderInterface;
         if (surface != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroySurfaceKHR);
             vkDestroySurfaceKHR(renderInterface->instance, surface, nullptr);
             surface = VK_NULL_HANDLE;
         }
@@ -2608,6 +2815,7 @@ namespace plume {
 
     uint32_t VulkanSwapChain::getRefreshRate() const {
         VkRefreshCycleDurationGOOGLE refreshCycle = {};
+        SNAP_VK_OP(vkGetRefreshCycleDurationGOOGLE);
         VkResult res = vkGetRefreshCycleDurationGOOGLE(commandQueue->device->vk, vk, &refreshCycle);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkGetRefreshCycleDurationGOOGLE failed with error code 0x%X.\n", res);
@@ -2646,6 +2854,7 @@ namespace plume {
         assert(signalSemaphore != nullptr);
 
         VulkanCommandSemaphore *interfaceSemaphore = static_cast<VulkanCommandSemaphore *>(signalSemaphore);
+        SNAP_VK_OP(vkAcquireNextImageKHR);
         VkResult res = vkAcquireNextImageKHR(commandQueue->device->vk, vk, UINT64_MAX, interfaceSemaphore->vk, VK_NULL_HANDLE, textureIndex);
         if ((res != VK_SUCCESS) && (res != VK_SUBOPTIMAL_KHR)) {
             return false;
@@ -2656,6 +2865,7 @@ namespace plume {
 
     void VulkanSwapChain::releaseSwapChain() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroySwapchainKHR);
             vkDestroySwapchainKHR(commandQueue->device->vk, vk, nullptr);
             vk = VK_NULL_HANDLE;
         }
@@ -2664,6 +2874,7 @@ namespace plume {
     void VulkanSwapChain::releaseImageViews() {
         for (VulkanTexture &texture : textures) {
             if (texture.imageView != VK_NULL_HANDLE) {
+                SNAP_VK_OP(vkDestroyImageView);
                 vkDestroyImageView(commandQueue->device->vk, texture.imageView, nullptr);
                 texture.imageView = VK_NULL_HANDLE;
             }
@@ -2785,6 +2996,7 @@ namespace plume {
         passInfo.pSubpasses = &subpass;
         passInfo.subpassCount = 1;
 
+        SNAP_VK_OP(vkCreateRenderPass);
         res = vkCreateRenderPass(device->vk, &passInfo, nullptr, &renderPass);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateRenderPass failed with error code 0x%X.\n", res);
@@ -2800,6 +3012,7 @@ namespace plume {
         fbInfo.height = height;
         fbInfo.layers = 1;
 
+        SNAP_VK_OP(vkCreateFramebuffer);
         res = vkCreateFramebuffer(device->vk, &fbInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateFramebuffer failed with error code 0x%X.\n", res);
@@ -2809,10 +3022,12 @@ namespace plume {
 
     VulkanFramebuffer::~VulkanFramebuffer() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyFramebuffer);
             vkDestroyFramebuffer(device->vk, vk, nullptr);
         }
 
         if (renderPass != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyRenderPass);
             vkDestroyRenderPass(device->vk, renderPass, nullptr);
         }
     }
@@ -2850,6 +3065,7 @@ namespace plume {
         createInfo.queryType = VK_QUERY_TYPE_TIMESTAMP;
         createInfo.queryCount = queryCount;
         
+        SNAP_VK_OP(vkCreateQueryPool);
         VkResult res = vkCreateQueryPool(device->vk, &createInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateQueryPool failed with error code 0x%X.\n", res);
@@ -2860,10 +3076,12 @@ namespace plume {
     }
 
     VulkanQueryPool::~VulkanQueryPool() {
+        SNAP_VK_OP(vkDestroyQueryPool);
         vkDestroyQueryPool(device->vk, vk, nullptr);
     }
 
     void VulkanQueryPool::queryResults() {
+	    SNAP_VK_OP(vkGetQueryPoolResults);
 	    VkResult res = vkGetQueryPoolResults(device->vk, vk, 0, uint32_t(results.size()), sizeof(uint64_t) * results.size(), results.data(), sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkGetQueryPoolResults failed with error code 0x%X.\n", res);
@@ -2923,6 +3141,7 @@ namespace plume {
         poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
         poolInfo.queueFamilyIndex = queue->device->queueFamilyIndices[toFamilyIndex(queue->type)];
 
+        SNAP_VK_OP(vkCreateCommandPool);
         VkResult res = vkCreateCommandPool(queue->device->vk, &poolInfo, nullptr, &commandPool);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateCommandPool failed with error code 0x%X.\n", res);
@@ -2935,6 +3154,7 @@ namespace plume {
         allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         allocateInfo.commandBufferCount = 1;
 
+        SNAP_VK_OP(vkAllocateCommandBuffers);
         res = vkAllocateCommandBuffers(queue->device->vk, &allocateInfo, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkAllocateCommandBuffers failed with error code 0x%X.\n", res);
@@ -2944,21 +3164,25 @@ namespace plume {
 
     VulkanCommandList::~VulkanCommandList() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkFreeCommandBuffers);
             vkFreeCommandBuffers(queue->device->vk, commandPool, 1, &vk);
         }
 
         if (commandPool != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyCommandPool);
             vkDestroyCommandPool(queue->device->vk, commandPool, nullptr);
         }
     }
 
     void VulkanCommandList::begin() {
+        SNAP_VK_OP(vkResetCommandBuffer);
         vkResetCommandBuffer(vk, 0);
 
         VkCommandBufferBeginInfo beginInfo = {};
         beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
+        SNAP_VK_OP(vkBeginCommandBuffer);
         VkResult res = vkBeginCommandBuffer(vk, &beginInfo);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkBeginCommandBuffer failed with error code 0x%X.\n", res);
@@ -2969,6 +3193,7 @@ namespace plume {
     void VulkanCommandList::end() {
         endActiveRenderPass();
 
+        SNAP_VK_OP(vkEndCommandBuffer);
         VkResult res = vkEndCommandBuffer(vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkEndCommandBuffer failed with error code 0x%X.\n", res);
@@ -3042,12 +3267,14 @@ namespace plume {
             return;
         }
 
+        SNAP_VK_OP(vkCmdPipelineBarrier);
         vkCmdPipelineBarrier(vk, srcStageMask, dstStageMask, 0, 0, nullptr, uint32_t(bufferMemoryBarriers.size()), bufferMemoryBarriers.data(), uint32_t(imageMemoryBarriers.size()), imageMemoryBarriers.data());
     }
 
     void VulkanCommandList::dispatch(uint32_t threadGroupCountX, uint32_t threadGroupCountY, uint32_t threadGroupCountZ) {
         assert(activeComputePipelineLayout != nullptr);
 
+        SNAP_VK_OP(vkCmdDispatch);
         vkCmdDispatch(vk, threadGroupCountX, threadGroupCountY, threadGroupCountZ);
     }
 
@@ -3061,6 +3288,7 @@ namespace plume {
         tableAddressInfo.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
         tableAddressInfo.buffer = interfaceBuffer->vk;
 
+        SNAP_VK_OP(vkGetBufferDeviceAddress);
         const VkDeviceAddress tableAddress = vkGetBufferDeviceAddress(queue->device->vk, &tableAddressInfo) + shaderBindingTable.offset;
         const RenderShaderBindingGroupInfo &rayGen = shaderBindingGroupsInfo.rayGen;
         const RenderShaderBindingGroupInfo &miss = shaderBindingGroupsInfo.miss;
@@ -3082,6 +3310,7 @@ namespace plume {
         callableSbt.deviceAddress = (callable.size > 0) ? (tableAddress + callable.offset + callable.startIndex * callable.stride) : 0;
         callableSbt.size = callable.size;
         callableSbt.stride = callable.stride;
+        SNAP_VK_OP(vkCmdTraceRaysKHR);
         vkCmdTraceRaysKHR(vk, &rayGenSbt, &missSbt, &hitSbt, &callableSbt, width, height, depth);
     }
 
@@ -3089,6 +3318,7 @@ namespace plume {
         assert(activeGraphicsPipelineLayout != nullptr);
         checkActiveRenderPass();
 
+        SNAP_VK_OP(vkCmdDraw);
         vkCmdDraw(vk, vertexCountPerInstance, instanceCount, startVertexLocation, startInstanceLocation);
     }
     
@@ -3096,6 +3326,7 @@ namespace plume {
         assert(activeGraphicsPipelineLayout != nullptr);
         checkActiveRenderPass();
 
+        SNAP_VK_OP(vkCmdDrawIndexed);
         vkCmdDrawIndexed(vk, indexCountPerInstance, instanceCount, startIndexLocation, baseVertexLocation, startInstanceLocation);
     }
 
@@ -3106,16 +3337,19 @@ namespace plume {
         switch (interfacePipeline->type) {
         case VulkanPipeline::Type::Compute: {
             const VulkanComputePipeline *computePipeline = static_cast<const VulkanComputePipeline *>(interfacePipeline);
+            SNAP_VK_OP(vkCmdBindPipeline);
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_COMPUTE, computePipeline->vk);
             break;
         }
         case VulkanPipeline::Type::Graphics: {
             const VulkanGraphicsPipeline *graphicsPipeline = static_cast<const VulkanGraphicsPipeline *>(interfacePipeline);
+            SNAP_VK_OP(vkCmdBindPipeline);
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline->vk);
             break;
         }
         case VulkanPipeline::Type::Raytracing: {
             const VulkanRaytracingPipeline *raytracingPipeline = static_cast<const VulkanRaytracingPipeline *>(interfacePipeline);
+            SNAP_VK_OP(vkCmdBindPipeline);
             vkCmdBindPipeline(vk, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, raytracingPipeline->vk);
             break;
         }
@@ -3136,6 +3370,7 @@ namespace plume {
         assert(rangeIndex < activeComputePipelineLayout->pushConstantRanges.size());
         
         const VkPushConstantRange &range = activeComputePipelineLayout->pushConstantRanges[rangeIndex];
+        SNAP_VK_OP(vkCmdPushConstants);
         vkCmdPushConstants(vk, activeComputePipelineLayout->vk, range.stageFlags & VK_SHADER_STAGE_COMPUTE_BIT, range.offset + offset, size == 0 ? range.size : size, data);
     }
 
@@ -3154,6 +3389,7 @@ namespace plume {
         assert(rangeIndex < activeGraphicsPipelineLayout->pushConstantRanges.size());
 
         const VkPushConstantRange &range = activeGraphicsPipelineLayout->pushConstantRanges[rangeIndex];
+        SNAP_VK_OP(vkCmdPushConstants);
         vkCmdPushConstants(vk, activeGraphicsPipelineLayout->vk, range.stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS, range.offset + offset, size == 0 ? range.size : size, data);
     }
 
@@ -3179,6 +3415,7 @@ namespace plume {
         const VkShaderStageFlags raytracingStageFlags = VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR | VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
             VK_SHADER_STAGE_MISS_BIT_KHR | VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR;
 
+        SNAP_VK_OP(vkCmdPushConstants);
         vkCmdPushConstants(vk, activeRaytracingPipelineLayout->vk, range.stageFlags & raytracingStageFlags, range.offset + offset, size == 0 ? range.size : size, data);
     }
 
@@ -3189,6 +3426,7 @@ namespace plume {
     void VulkanCommandList::setIndexBuffer(const RenderIndexBufferView *view) {
         if (view != nullptr) {
             const VulkanBuffer *interfaceBuffer = static_cast<const VulkanBuffer *>(view->buffer.ref);
+            SNAP_VK_OP(vkCmdBindIndexBuffer);
             vkCmdBindIndexBuffer(vk, (interfaceBuffer != nullptr) ? interfaceBuffer->vk : VK_NULL_HANDLE, view->buffer.offset, toIndexType(view->format));
         }
     }
@@ -3212,6 +3450,7 @@ namespace plume {
                 offsetVector.emplace_back(views[i].buffer.offset);
             }
 
+            SNAP_VK_OP(vkCmdBindVertexBuffers);
             vkCmdBindVertexBuffers(vk, startSlot, viewCount, bufferVector.data(), offsetVector.data());
         }
     }
@@ -3226,12 +3465,14 @@ namespace plume {
             }
 
             if (!viewportVector.empty()) {
+                SNAP_VK_OP(vkCmdSetViewport);
                 vkCmdSetViewport(vk, 0, uint32_t(viewportVector.size()), viewportVector.data());
             }
         }
         else {
             // Single element fast path.
             VkViewport viewport = VkViewport{ viewports[0].x, viewports[0].y, viewports[0].width, viewports[0].height, viewports[0].minDepth, viewports[0].maxDepth };
+            SNAP_VK_OP(vkCmdSetViewport);
             vkCmdSetViewport(vk, 0, 1, &viewport);
         }
     }
@@ -3256,12 +3497,14 @@ namespace plume {
             }
 
             if (!scissorVector.empty()) {
+                SNAP_VK_OP(vkCmdSetScissor);
                 vkCmdSetScissor(vk, 0, uint32_t(scissorVector.size()), scissorVector.data());
             }
         }
         else {
             // Single element fast path.
             VkRect2D scissor = snapScissor(scissorRects[0]);
+            SNAP_VK_OP(vkCmdSetScissor);
             vkCmdSetScissor(vk, 0, 1, &scissor);
         }
     }
@@ -3279,6 +3522,7 @@ namespace plume {
     }
 
     void VulkanCommandList::setDepthBias(float depthBias, float depthBiasClamp, float slopeScaledDepthBias) {
+        SNAP_VK_OP(vkCmdSetDepthBias);
         vkCmdSetDepthBias(vk, depthBias, depthBiasClamp, slopeScaledDepthBias);
     }
 
@@ -3340,6 +3584,7 @@ namespace plume {
         rgba[3] = colorValue.a;
         attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         attachment.colorAttachment = attachmentIndex;
+        SNAP_VK_OP(vkCmdClearAttachments);
         vkCmdClearAttachments(vk, 1, &attachment, uint32_t(rectVector.size()), rectVector.data());
     }
 
@@ -3366,6 +3611,7 @@ namespace plume {
             attachment.aspectMask |= VK_IMAGE_ASPECT_STENCIL_BIT;
         }
 
+        SNAP_VK_OP(vkCmdClearAttachments);
         vkCmdClearAttachments(vk, 1, &attachment, uint32_t(rectVector.size()), rectVector.data());
     }
 
@@ -3381,6 +3627,7 @@ namespace plume {
         bufferCopy.dstOffset = dstBuffer.offset;
         bufferCopy.srcOffset = srcBuffer.offset;
         bufferCopy.size = size;
+        SNAP_VK_OP(vkCmdCopyBuffer);
         vkCmdCopyBuffer(vk, interfaceSrcBuffer->vk, interfaceDstBuffer->vk, 1, &bufferCopy);
     }
 
@@ -3413,6 +3660,7 @@ namespace plume {
             imageCopy.imageExtent.width = srcLocation.placedFootprint.width;
             imageCopy.imageExtent.height = srcLocation.placedFootprint.height;
             imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
+            SNAP_VK_OP(vkCmdCopyBufferToImage);
             vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
         }
         else if ((dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) && (srcLocation.type == RenderTextureCopyType::SUBRESOURCE)) {
@@ -3452,6 +3700,7 @@ namespace plume {
                 imageCopy.imageExtent.height = dstLocation.placedFootprint.height;
                 imageCopy.imageExtent.depth = dstLocation.placedFootprint.depth;
             }
+            SNAP_VK_OP(vkCmdCopyImageToBuffer);
             vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
         }
         else {
@@ -3485,6 +3734,7 @@ namespace plume {
                 imageCopy.extent.depth = srcTexture->desc.depth;
             }
 
+            SNAP_VK_OP(vkCmdCopyImage);
             vkCmdCopyImage(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
         }
     }
@@ -3501,6 +3751,7 @@ namespace plume {
         bufferCopy.dstOffset = 0;
         bufferCopy.srcOffset = 0;
         bufferCopy.size = interfaceDstBuffer->desc.size;
+        SNAP_VK_OP(vkCmdCopyBuffer);
         vkCmdCopyBuffer(vk, interfaceSrcBuffer->vk, interfaceDstBuffer->vk, 1, &bufferCopy);
     }
 
@@ -3537,6 +3788,7 @@ namespace plume {
             imageCopies.emplace_back(imageCopy);
         }
 
+        SNAP_VK_OP(vkCmdCopyImage);
         vkCmdCopyImage(vk, src->vk, srcLayout, dst->vk, dstLayout, uint32_t(imageCopies.size()), imageCopies.data());
     }
 
@@ -3587,6 +3839,7 @@ namespace plume {
             imageResolves.emplace_back(imageResolve);
         }
 
+        SNAP_VK_OP(vkCmdResolveImage);
         vkCmdResolveImage(vk, src->vk, srcLayout, dst->vk, dstLayout, uint32_t(imageResolves.size()), imageResolves.data());
     }
     
@@ -3621,6 +3874,7 @@ namespace plume {
         buildRangeInfo.transformOffset = 0;
 
         VkAccelerationStructureBuildRangeInfoKHR *buildRangeInfoPtr = &buildRangeInfo;
+        SNAP_VK_OP(vkCmdBuildAccelerationStructuresKHR);
         vkCmdBuildAccelerationStructuresKHR(vk, 1, &buildGeometryInfo, &buildRangeInfoPtr);
     }
 
@@ -3670,6 +3924,7 @@ namespace plume {
         buildRangeInfo.transformOffset = 0;
 
         VkAccelerationStructureBuildRangeInfoKHR *buildRangeInfoPtr = &buildRangeInfo;
+        SNAP_VK_OP(vkCmdBuildAccelerationStructuresKHR);
         vkCmdBuildAccelerationStructuresKHR(vk, 1, &buildGeometryInfo, &buildRangeInfoPtr);
     }
 
@@ -3681,6 +3936,7 @@ namespace plume {
         assert(queryPool != nullptr);
 
         const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
+        SNAP_VK_OP(vkCmdResetQueryPool);
         vkCmdResetQueryPool(vk, interfaceQueryPool->vk, queryFirstIndex, queryCount);
     }
 
@@ -3688,6 +3944,7 @@ namespace plume {
         assert(queryPool != nullptr);
 
         const VulkanQueryPool *interfaceQueryPool = static_cast<const VulkanQueryPool *>(queryPool);
+        SNAP_VK_OP(vkCmdWriteTimestamp);
         vkCmdWriteTimestamp(vk, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, interfaceQueryPool->vk, queryIndex);
     }
 
@@ -3701,6 +3958,7 @@ namespace plume {
             beginInfo.framebuffer = targetFramebuffer->vk;
             beginInfo.renderArea.extent.width = targetFramebuffer->width;
             beginInfo.renderArea.extent.height = targetFramebuffer->height;
+            SNAP_VK_OP(vkCmdBeginRenderPass);
             vkCmdBeginRenderPass(vk, &beginInfo, VkSubpassContents::VK_SUBPASS_CONTENTS_INLINE);
             activeRenderPass = targetFramebuffer->renderPass;
         }
@@ -3708,6 +3966,7 @@ namespace plume {
 
     void VulkanCommandList::endActiveRenderPass() {
         if (activeRenderPass != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkCmdEndRenderPass);
             vkCmdEndRenderPass(vk);
             activeRenderPass = VK_NULL_HANDLE;
         }
@@ -3719,6 +3978,7 @@ namespace plume {
         assert(setIndex < pipelineLayout->descriptorSetLayouts.size());
 
         const VulkanDescriptorSet *interfaceSet = static_cast<const VulkanDescriptorSet *>(descriptorSet);
+        SNAP_VK_OP(vkCmdBindDescriptorSets);
         vkCmdBindDescriptorSets(vk, bindPoint, pipelineLayout->vk, setIndex, 1, &interfaceSet->vk, 0, nullptr);
     }
 
@@ -3732,6 +3992,7 @@ namespace plume {
         VkFenceCreateInfo fenceInfo = {};
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
 
+        SNAP_VK_OP(vkCreateFence);
         VkResult res = vkCreateFence(device->vk, &fenceInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateFence failed with error code 0x%X.\n", res);
@@ -3741,6 +4002,7 @@ namespace plume {
 
     VulkanCommandFence::~VulkanCommandFence() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyFence);
             vkDestroyFence(device->vk, vk, nullptr);
         }
     }
@@ -3755,6 +4017,7 @@ namespace plume {
         VkSemaphoreCreateInfo semaphoreInfo = {};
         semaphoreInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
 
+        SNAP_VK_OP(vkCreateSemaphore);
         VkResult res = vkCreateSemaphore(device->vk, &semaphoreInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateSemaphore failed with error code 0x%X.\n", res);
@@ -3764,6 +4027,7 @@ namespace plume {
 
     VulkanCommandSemaphore::~VulkanCommandSemaphore() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroySemaphore);
             vkDestroySemaphore(device->vk, vk, nullptr);
         }
     }
@@ -3847,7 +4111,14 @@ namespace plume {
         VkResult res;
         {
             const std::scoped_lock queueLock(*queue->mutex);
+            SNAP_VK_OP(vkQueueSubmit);
             res = vkQueueSubmit(queue->vk, 1, &submitInfo, submitFence);
+        }
+        {
+            static std::atomic<bool> said{false};
+            if (!said.exchange(true)) {
+                fprintf(stderr, "[SNAP-VK] the first submit returned 0x%X\n", res);
+            }
         }
 
         if (res != VK_SUCCESS) {
@@ -3860,12 +4131,14 @@ namespace plume {
         assert(fence != nullptr);
 
         VulkanCommandFence *interfaceFence = static_cast<VulkanCommandFence *>(fence);
+        SNAP_VK_OP(vkWaitForFences);
         VkResult res = vkWaitForFences(device->vk, 1, &interfaceFence->vk, VK_TRUE, UINT64_MAX);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkWaitForFences failed with error code 0x%X.\n", res);
             return;
         }
 
+        SNAP_VK_OP(vkResetFences);
         vkResetFences(device->vk, 1, &interfaceFence->vk);
     }
 
@@ -3893,6 +4166,7 @@ namespace plume {
         }
 
         uint32_t memoryTypeIndex = 0;
+        SNAP_VK_OP(vmaFindMemoryTypeIndex);
         VkResult res = vmaFindMemoryTypeIndex(device->allocator, UINT32_MAX, &memoryInfo, &memoryTypeIndex);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vmaFindMemoryTypeIndex failed with error code 0x%X.\n", res);
@@ -3905,6 +4179,7 @@ namespace plume {
         createInfo.maxBlockCount = desc.maxBlockCount;
         createInfo.flags |= desc.useLinearAlgorithm ? VMA_POOL_CREATE_LINEAR_ALGORITHM_BIT : 0;
 
+        SNAP_VK_OP(vmaCreatePool);
         res = vmaCreatePool(device->allocator, &createInfo, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vmaCreatePool failed with error code 0x%X.\n", res);
@@ -3914,6 +4189,7 @@ namespace plume {
 
     VulkanPool::~VulkanPool() {
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vmaDestroyPool);
             vmaDestroyPool(device->allocator, vk);
         }
     }
@@ -3965,6 +4241,7 @@ namespace plume {
         this->renderInterface = renderInterface;
 
         uint32_t deviceCount = 0;
+        SNAP_VK_OP(vkEnumeratePhysicalDevices);
         vkEnumeratePhysicalDevices(renderInterface->instance, &deviceCount, nullptr);
         if (deviceCount == 0) {
             fprintf(stderr, "Unable to find devices that support Vulkan.\n");
@@ -3972,6 +4249,7 @@ namespace plume {
         }
         
         std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
+        SNAP_VK_OP(vkEnumeratePhysicalDevices);
         vkEnumeratePhysicalDevices(renderInterface->instance, &deviceCount, physicalDevices.data());
 
         uint32_t currentDeviceTypeScore = 0;
@@ -3985,6 +4263,7 @@ namespace plume {
 
         for (uint32_t i = 0; i < deviceCount; i++) {
             VkPhysicalDeviceProperties deviceProperties;
+            SNAP_VK_OP(vkGetPhysicalDeviceProperties);
             vkGetPhysicalDeviceProperties(physicalDevices[i], &deviceProperties);
 
             uint32_t deviceTypeIndex = deviceProperties.deviceType;
@@ -4018,9 +4297,11 @@ namespace plume {
 
         // Check for extensions.
         uint32_t extensionCount;
+        SNAP_VK_OP(vkEnumerateDeviceExtensionProperties);
         vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, nullptr);
 
         std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+        SNAP_VK_OP(vkEnumerateDeviceExtensionProperties);
         vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &extensionCount, availableExtensions.data());
 
         std::unordered_set<std::string> missingRequiredExtensions = RequiredDeviceExtensions;
@@ -4052,6 +4333,7 @@ namespace plume {
         }
 
         // Store properties.
+        SNAP_VK_OP(vkGetPhysicalDeviceProperties);
         vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
 
         // Check for supported features.
@@ -4124,6 +4406,7 @@ namespace plume {
         VkPhysicalDeviceFeatures2 deviceFeatures = {};
         deviceFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
         deviceFeatures.pNext = featuresChain;
+        SNAP_VK_OP(vkGetPhysicalDeviceFeatures2);
         vkGetPhysicalDeviceFeatures2(physicalDevice, &deviceFeatures);
 
         // Check for properties.
@@ -4133,6 +4416,7 @@ namespace plume {
             VkPhysicalDeviceProperties2 deviceProperties2 = {};
             deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
             deviceProperties2.pNext = &rtPipelineProperties;
+            SNAP_VK_OP(vkGetPhysicalDeviceProperties2);
             vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
         }
 
@@ -4143,6 +4427,7 @@ namespace plume {
             VkPhysicalDeviceProperties2 deviceProperties2 = {};
             deviceProperties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
             deviceProperties2.pNext = &sampleLocationProperties;
+            SNAP_VK_OP(vkGetPhysicalDeviceProperties2);
             vkGetPhysicalDeviceProperties2(physicalDevice, &deviceProperties2);
         }
 
@@ -4197,10 +4482,12 @@ namespace plume {
 
         // Retrieve the information for the queue families.
         uint32_t queueFamilyCount = 0;
+        SNAP_VK_OP(vkGetPhysicalDeviceQueueFamilyProperties);
         vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, nullptr);
 
         std::vector<VkQueueFamilyProperties> queueFamilyProperties(queueFamilyCount);
         std::vector<bool> queueFamilyUsed(queueFamilyCount, false);
+        SNAP_VK_OP(vkGetPhysicalDeviceQueueFamilyProperties);
         vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, &queueFamilyCount, queueFamilyProperties.data());
 
         auto pickFamilyQueue = [&](RenderCommandListType type, VkQueueFlags flags) {
@@ -4274,6 +4561,7 @@ namespace plume {
         createInfo.enabledExtensionCount = uint32_t(enabledExtensions.size());
         createInfo.pEnabledFeatures = &deviceFeatures.features;
 
+        SNAP_VK_OP(vkCreateDevice);
         VkResult res = vkCreateDevice(physicalDevice, &createInfo, nullptr, &vk);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateDevice failed with error code 0x%X.\n", res);
@@ -4282,6 +4570,7 @@ namespace plume {
 
         for (uint32_t i = 0; i < queueFamilyCount; i++) {
             for (uint32_t j = 0; j < queueFamilies[i].queues.size(); j++) {
+                SNAP_VK_OP(vkGetDeviceQueue);
                 vkGetDeviceQueue(vk, i, j, &queueFamilies[i].queues[j].vk);
             }
         }
@@ -4315,6 +4604,7 @@ namespace plume {
         allocatorInfo.instance = renderInterface->instance;
         allocatorInfo.vulkanApiVersion = renderInterface->appInfo.apiVersion;
 
+        SNAP_VK_OP(vmaCreateAllocator);
         res = vmaCreateAllocator(&allocatorInfo, &allocator);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vmaCreateAllocator failed with error code 0x%X.\n", res);
@@ -4325,6 +4615,7 @@ namespace plume {
         // Find the biggest device local memory available on the device.
         VkDeviceSize memoryHeapSize = 0;
         const VkPhysicalDeviceMemoryProperties *memoryProps = nullptr;
+        SNAP_VK_OP(vmaGetMemoryProperties);
         vmaGetMemoryProperties(allocator, &memoryProps);
 
         constexpr VkMemoryPropertyFlags uploadHeapPropertyFlags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
@@ -4362,6 +4653,7 @@ namespace plume {
             if (descriptorIndexingFound || (physicalDeviceProperties.apiVersion >= VK_API_VERSION_1_2)) {
                 props2.pNext = &indexingProps;
             }
+            SNAP_VK_OP(vkGetPhysicalDeviceProperties2);
             vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
             fprintf(stderr, "[SNAP-VK] descriptor indexing: extension %s, in use %s; update-after-bind descriptors in all pools %u; sampled images per stage %u (update after bind %u), per set %u (update after bind %u)\n",
                 descriptorIndexingFound ? "listed" : "not listed", descriptorIndexingSupported ? "yes" : "no",
@@ -4537,6 +4829,7 @@ namespace plume {
 
         VkAccelerationStructureBuildSizesInfoKHR buildSizesInfo = {};
         buildSizesInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+        SNAP_VK_OP(vkGetAccelerationStructureBuildSizesKHR);
         vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildGeometryInfo, geometryPrimitiveCounts.data(), &buildSizesInfo);
 
         buildInfo.meshCount = meshCount;
@@ -4590,6 +4883,7 @@ namespace plume {
 
         VkAccelerationStructureBuildSizesInfoKHR buildSizesInfo = {};
         buildSizesInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+        SNAP_VK_OP(vkGetAccelerationStructureBuildSizesKHR);
         vkGetAccelerationStructureBuildSizesKHR(vk, VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR, &buildGeometryInfo, &instanceCount, &buildSizesInfo);
 
         buildInfo.instanceCount = instanceCount;
@@ -4611,6 +4905,7 @@ namespace plume {
         thread_local std::vector<uint8_t> groupHandles;
         groupHandles.clear();
         groupHandles.resize(raytracingPipeline->groupCount * handleSize, 0);
+        SNAP_VK_OP(vkGetRayTracingShaderGroupHandlesKHR);
         VkResult res = vkGetRayTracingShaderGroupHandlesKHR(vk, raytracingPipeline->vk, 0, raytracingPipeline->groupCount, groupHandles.size(), groupHandles.data());
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkGetRayTracingShaderGroupHandlesKHR failed with error code 0x%X.\n", res);
@@ -4681,11 +4976,13 @@ namespace plume {
         nullBuffer = nullptr; // force destruction before destroying allocator
 
         if (allocator != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vmaDestroyAllocator);
             vmaDestroyAllocator(allocator);
             allocator = VK_NULL_HANDLE;
         }
 
         if (vk != VK_NULL_HANDLE) {
+            SNAP_VK_OP(vkDestroyDevice);
             vkDestroyDevice(vk, nullptr);
             vk = VK_NULL_HANDLE;
         }
@@ -4737,9 +5034,11 @@ namespace plume {
 
         // Check for extensions.
         uint32_t extensionCount;
+        SNAP_VK_OP(vkEnumerateInstanceExtensionProperties);
         vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, nullptr);
 
         std::vector<VkExtensionProperties> availableExtensions(extensionCount);
+        SNAP_VK_OP(vkEnumerateInstanceExtensionProperties);
         vkEnumerateInstanceExtensionProperties(nullptr, &extensionCount, availableExtensions.data());
 
         std::unordered_set<std::string> requiredExtensions = RequiredInstanceExtensions;
@@ -4805,9 +5104,11 @@ namespace plume {
 #   ifdef VULKAN_VALIDATION_LAYER_ENABLED
         // Search for validation layer and enabled it.
         uint32_t layerCount;
+        SNAP_VK_OP(vkEnumerateInstanceLayerProperties);
         vkEnumerateInstanceLayerProperties(&layerCount, nullptr);
 
         std::vector<VkLayerProperties> availableLayers(layerCount);
+        SNAP_VK_OP(vkEnumerateInstanceLayerProperties);
         vkEnumerateInstanceLayerProperties(&layerCount, availableLayers.data());
         
         const char validationLayerName[] = "VK_LAYER_KHRONOS_validation";
@@ -4821,6 +5122,7 @@ namespace plume {
         }
 #   endif
         
+        SNAP_VK_OP(vkCreateInstance);
         res = vkCreateInstance(&createInfo, nullptr, &instance);
         if (res != VK_SUCCESS) {
             fprintf(stderr, "vkCreateInstance failed with error code 0x%X.\n", res);
@@ -4834,13 +5136,16 @@ namespace plume {
 
         // Fill device names.
         uint32_t deviceCount = 0;
+        SNAP_VK_OP(vkEnumeratePhysicalDevices);
         vkEnumeratePhysicalDevices(instance, &deviceCount, nullptr);
         if (deviceCount > 0) {
             std::vector<VkPhysicalDevice> physicalDevices(deviceCount);
+            SNAP_VK_OP(vkEnumeratePhysicalDevices);
             vkEnumeratePhysicalDevices(instance, &deviceCount, physicalDevices.data());
 
             for (uint32_t i = 0; i < deviceCount; i++) {
                 VkPhysicalDeviceProperties deviceProperties;
+                SNAP_VK_OP(vkGetPhysicalDeviceProperties);
                 vkGetPhysicalDeviceProperties(physicalDevices[i], &deviceProperties);
                 uint32_t deviceTypeIndex = deviceProperties.deviceType;
                 if (deviceTypeIndex <= 4) {
@@ -4852,6 +5157,7 @@ namespace plume {
 
     VulkanInterface::~VulkanInterface() {
         if (instance != nullptr) {
+            SNAP_VK_OP(vkDestroyInstance);
             vkDestroyInstance(instance, nullptr);
         }
     }
