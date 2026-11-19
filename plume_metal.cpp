@@ -9,6 +9,8 @@
 #define CA_PRIVATE_IMPLEMENTATION
 #define MTL_PRIVATE_IMPLEMENTATION
 
+#include <objc/message.h>
+#include <objc/runtime.h>
 #include <Foundation/Foundation.hpp>
 #include <Metal/Metal.hpp>
 #include <QuartzCore/QuartzCore.hpp>
@@ -1877,6 +1879,7 @@ namespace plume {
 
         resourceEntries[descriptorIndex].resource = nativeResource;
         resourceEntries[descriptorIndex].type = descriptorType;
+        residencyVersion++;
     }
 
     RenderDescriptorRangeType MetalDescriptorSet::getDescriptorType(const uint32_t binding) const {
@@ -2229,7 +2232,16 @@ namespace plume {
         }
         const NS::Data* data = sampleBuffer->resolveCounterRange(NS::Range(0, results.size()));
         if (data != nullptr) {
-            std::memcpy(results.data(), data->mutableBytes(), results.size() * sizeof(uint64_t));
+            // resolveCounterRange returns an NSData, which only NSMutableData extends with mutableBytes:
+            // Apple GPUs' drivers happen to hand back a mutable object, Intel's an immutable one, and sending
+            // it mutableBytes raised an Objective-C exception that ended the program on the first frame.
+            // Every NSData answers bytes.
+            static SEL bytesSelector = sel_registerName("bytes");
+            const void *bytes = reinterpret_cast<const void *(*)(const void *, SEL)>(objc_msgSend)(data, bytesSelector);
+            const size_t size = std::min<size_t>(data->length(), results.size() * sizeof(uint64_t));
+            if (bytes != nullptr) {
+                std::memcpy(results.data(), bytes, size);
+            }
         }
     }
 
@@ -2465,6 +2477,8 @@ namespace plume {
         MetalAutoreleasePool releasePool;
         checkActiveComputeEncoder();
 
+        makeBoundResourcesResident(true);
+
         const MTL::Size threadGroupCount = { threadGroupCountX, threadGroupCountY, threadGroupCountZ };
         const MTL::Size threadGroupSize = { activeComputeState->threadGroupSizeX, activeComputeState->threadGroupSizeY, activeComputeState->threadGroupSizeZ };
         activeComputeEncoder->dispatchThreadgroups(threadGroupCount, threadGroupSize);
@@ -2506,6 +2520,7 @@ namespace plume {
         MetalAutoreleasePool releasePool;
         checkActiveRenderEncoder();
         checkForUpdatesInGraphicsState();
+        makeBoundResourcesResident(false);
 
         activeRenderEncoder->drawPrimitives(activeRenderState->primitiveType, startVertexLocation, vertexCountPerInstance, instanceCount, startInstanceLocation);
     }
@@ -2516,6 +2531,7 @@ namespace plume {
         MetalAutoreleasePool releasePool;
         checkActiveRenderEncoder();
         checkForUpdatesInGraphicsState();
+        makeBoundResourcesResident(false);
 
         activeRenderEncoder->drawIndexedPrimitives(currentPrimitiveType, indexCountPerInstance, currentIndexType, indexBuffer, indexBufferOffset + (startIndexLocation * indexTypeSize), instanceCount, baseVertexLocation, startInstanceLocation);
     }
@@ -2803,9 +2819,6 @@ namespace plume {
         // For partial clears, do our own quad-based clear
         checkActiveRenderEncoder();
 
-        // Store state cache
-        const auto previousCache = stateCache;
-
         // Process clears
         activeRenderEncoder->pushDebugGroup(MTLSTR("ColorClear"));
 
@@ -2870,8 +2883,12 @@ namespace plume {
 
         activeRenderEncoder->popDebugGroup();
 
-        // Restore previous state if we had one
-        stateCache = previousCache;
+        // The clear bound its own pipeline, depth-stencil state, viewport, scissor, cull mode, depth bias
+        // and buffers on the encoder. Forget what the cache says is bound so the next draw binds its own
+        // state again: restoring the cache from before the clear made the next draw skip rebinding a
+        // pipeline or depth-stencil state it believed was still bound, and draw with the clear's (depth
+        // writes off, compare always) -- no depth test and no depth written for the rest of the pass.
+        stateCache.reset();
         dirtyGraphicsState.setAll();
     }
 
@@ -2902,9 +2919,6 @@ namespace plume {
 
             // For partial clears, do our own quad-based clear
             checkActiveRenderEncoder();
-
-            // Store state cache
-            auto previousCache = stateCache;
 
             // Process clears
             activeRenderEncoder->pushDebugGroup(MTLSTR("DepthClear"));
@@ -2969,8 +2983,8 @@ namespace plume {
 
             activeRenderEncoder->popDebugGroup();
 
-            // Restore previous state if we had one
-            stateCache = previousCache;
+            // As after a color clear: the encoder holds the clear's state now, so nothing cached is bound.
+            stateCache.reset();
             dirtyGraphicsState.setAll();
         }
     }
@@ -3373,13 +3387,13 @@ namespace plume {
 
     void MetalCommandList::endActiveComputeEncoder() {
         if (activeComputeEncoder != nullptr) {
-            bindEncoderResources(activeComputeEncoder, true);
             barrierUpdate(MetalBarrierStage::COMPUTE, activeComputeEncoder);
             activeComputeEncoder->updateFence(timestampQueryFence);
             activeComputeEncoder->endEncoding();
             activeComputeEncoder->release();
             activeComputeEncoder = nullptr;
             currentEncoderDescriptorSets.clear();
+            resetEncoderResidency();
 
             // Clear state cache for compute
             stateCache.lastPushConstants.clear();
@@ -3574,13 +3588,13 @@ namespace plume {
 
     void MetalCommandList::endActiveRenderEncoder() {
         if (activeRenderEncoder != nullptr) {
-            bindEncoderResources(activeRenderEncoder, false);
             barrierUpdate(MetalBarrierStage::GRAPHICS, activeRenderEncoder);
             activeRenderEncoder->updateFence(timestampQueryFence, MTL::RenderStageVertex | MTL::RenderStageFragment);
             activeRenderEncoder->endEncoding();
             activeRenderEncoder->release();
             activeRenderEncoder = nullptr;
             currentEncoderDescriptorSets.clear();
+            resetEncoderResidency();
 
             // Mark all state as needing rebind for next encoder
             dirtyGraphicsState.setAll();
@@ -3643,42 +3657,113 @@ namespace plume {
         }
     }
 
-    void MetalCommandList::bindEncoderResources(MTL::CommandEncoder* encoder, bool isCompute) {
+    bool MetalCommandList::isActiveAttachment(const MTL::Texture *resource) const {
+        if ((targetFramebuffer == nullptr) || (resource == nullptr)) {
+            return false;
+        }
+
+        // Compare the underlying allocations: a view of an attachment shares its memory.
+        auto baseTexture = [](const MTL::Texture *texture) -> const MTL::Texture * {
+            if (texture == nullptr) {
+                return nullptr;
+            }
+            const MTL::Texture *parent = texture->parentTexture();
+            return (parent != nullptr) ? parent : texture;
+        };
+
+        const MTL::Texture *texture = baseTexture(resource);
+        for (const auto &attachment : targetFramebuffer->colorAttachments) {
+            if (baseTexture(attachment.getTexture()) == texture) {
+                return true;
+            }
+        }
+
+        if (targetFramebuffer->depthAttachment.format != RenderFormat::UNKNOWN) {
+            if (baseTexture(targetFramebuffer->depthAttachment.getTexture()) == texture) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    void MetalCommandList::resetEncoderResidency() {
+        encoderResidentSets.clear();
+        encoderResidentAddressableCount = 0;
+    }
+
+    void MetalCommandList::makeBoundResourcesResident(bool isCompute) {
+        // Residency sets keep everything resident already.
         if (device->residencySet != nullptr) {
-            // No need to do anything if residency sets are in use.
             return;
         }
 
-        if (isCompute) {
-            auto* computeEncoder = static_cast<MTL::ComputeCommandEncoder*>(encoder);
-            {
-                std::lock_guard lock(device->resourcesMutex);
-                for (const auto* resource : device->gpuAddressableResources) {
-                    computeEncoder->useResource(resource, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
-                }
-            }
-            for (const auto* descriptorSet : currentEncoderDescriptorSets) {
-                for (const auto& entry : descriptorSet->resourceEntries) {
-                    if (entry.resource != nullptr) {
-                        computeEncoder->useResource(entry.resource, mapResourceUsage(entry.type));
+        // useResource only covers the commands encoded after it: a draw or dispatch encoded before the call
+        // reads a resource it reaches through an argument buffer as zeros on GPUs that enforce residency,
+        // Intel's among them (Apple GPUs use residency sets and never come here). So every resource a bound
+        // descriptor set names is made resident here, before the command is encoded.
+        MTL::RenderCommandEncoder *renderEncoder = isCompute ? nullptr : activeRenderEncoder;
+        MTL::ComputeCommandEncoder *computeEncoder = isCompute ? activeComputeEncoder : nullptr;
+        if ((renderEncoder == nullptr) && (computeEncoder == nullptr)) {
+            return;
+        }
+
+        {
+            std::lock_guard lock(device->resourcesMutex);
+            const size_t addressableCount = device->gpuAddressableResources.size();
+            if (addressableCount != encoderResidentAddressableCount) {
+                for (const auto *resource : device->gpuAddressableResources) {
+                    if (computeEncoder != nullptr) {
+                        computeEncoder->useResource(resource, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+                    }
+                    else {
+                        renderEncoder->useResource(resource, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
                     }
                 }
+                encoderResidentAddressableCount = addressableCount;
             }
-        } else {
-            auto* renderEncoder = static_cast<MTL::RenderCommandEncoder*>(encoder);
-            {
-                std::lock_guard lock(device->resourcesMutex);
-                for (const auto* resource : device->gpuAddressableResources) {
-                    renderEncoder->useResource(resource, MTL::ResourceUsageRead | MTL::ResourceUsageWrite);
+        }
+
+        const MetalPipelineLayout *layout = isCompute ? activeComputePipelineLayout : activeGraphicsPipelineLayout;
+        MetalDescriptorSet *const *sets = isCompute ? computeDescriptorSets : renderDescriptorSets;
+        if (layout == nullptr) {
+            return;
+        }
+
+        const uint32_t setCount = std::min(layout->setLayoutCount, uint32_t(MAX_DESCRIPTOR_SET_BINDINGS));
+        for (uint32_t i = 0; i < setCount; i++) {
+            const MetalDescriptorSet *descriptorSet = sets[i];
+            if (descriptorSet == nullptr) {
+                continue;
+            }
+
+            auto it = encoderResidentSets.find(descriptorSet);
+            if ((it != encoderResidentSets.end()) && (it->second == descriptorSet->residencyVersion)) {
+                continue;
+            }
+
+            for (const auto &entry : descriptorSet->resourceEntries) {
+                if (entry.resource == nullptr) {
+                    continue;
+                }
+
+                // An attachment of the active render pass is resident already, and on Intel's driver a
+                // useResource call naming a texture that is also the pass's depth attachment stops the pass
+                // writing depth at all.
+                const bool isTexture = (entry.type == RenderDescriptorRangeType::TEXTURE) || (entry.type == RenderDescriptorRangeType::READ_WRITE_TEXTURE);
+                if ((renderEncoder != nullptr) && isTexture && isActiveAttachment(static_cast<const MTL::Texture *>(entry.resource))) {
+                    continue;
+                }
+
+                if (computeEncoder != nullptr) {
+                    computeEncoder->useResource(entry.resource, mapResourceUsage(entry.type));
+                }
+                else {
+                    renderEncoder->useResource(entry.resource, mapResourceUsage(entry.type), MTL::RenderStageVertex | MTL::RenderStageFragment);
                 }
             }
-            for (const auto* descriptorSet : currentEncoderDescriptorSets) {
-                for (const auto& entry : descriptorSet->resourceEntries) {
-                    if (entry.resource != nullptr) {
-                        renderEncoder->useResource(entry.resource, mapResourceUsage(entry.type), MTL::RenderStageVertex | MTL::RenderStageFragment);
-                    }
-                }
-            }
+
+            encoderResidentSets[descriptorSet] = descriptorSet->residencyVersion;
         }
     }
 
