@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <unordered_map>
 #include <set>
 #include <unordered_set>
 
@@ -216,6 +217,10 @@ namespace plume {
         std::vector<Descriptor> descriptors;
         MetalArgumentBuffer argumentBuffer;
         std::vector<ResourceEntry> resourceEntries;
+
+        // Bumped whenever a descriptor changes, so an encoder can tell whether the resources it made
+        // resident for this set are still the ones the set names.
+        uint64_t residencyVersion = 1;
 
         MetalDescriptorSet(MetalDevice *device, const RenderDescriptorSetDesc &desc);
         MetalDescriptorSet(MetalDevice *device, uint32_t entryCount);
@@ -448,7 +453,15 @@ namespace plume {
         MTL::Fence *timestampQueryFence = nullptr;
 
         std::unordered_set<MetalDescriptorSet*> currentEncoderDescriptorSets;
-        void bindEncoderResources(MTL::CommandEncoder* encoder, bool isCompute);
+
+        // Without residency sets, resources reached through argument buffers must be made resident with
+        // useResource before the draw or dispatch that reads them; these track what the active encoder has
+        // already made resident.
+        std::unordered_map<const MetalDescriptorSet*, uint64_t> encoderResidentSets;
+        size_t encoderResidentAddressableCount = 0;
+        void makeBoundResourcesResident(bool isCompute);
+        bool isActiveAttachment(const MTL::Texture *resource) const;
+        void resetEncoderResidency();
 
         MetalCommandList(const MetalCommandQueue *queue);
         ~MetalCommandList() override;
